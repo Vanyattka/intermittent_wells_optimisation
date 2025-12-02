@@ -2,7 +2,7 @@
 **Algorithm for optimisation of intermittent wells (ПКВ-mode) through analytical modelling and OLGA-verified simulation**
 
 This repository contains a Python implementation of the algorithm developed as part of my final qualification thesis:  
-**“Optimization of the "reservoir-well" system using modeling methods in software.”**
+**“Optimization of the "reservoir-well" system using modeling methods in software”.**
 
 The project provides a reproducible engineering workflow for selecting optimal accumulation and pumping cycle durations for wells equipped with ESPs (УЭЦН), operating in intermittent mode (ПКВ).
 
@@ -15,7 +15,7 @@ Intermittent operation of ESP wells is widely used on mature fields with decreas
 - unstable ESP operation;  
 - excessive number of restarts - reduced MTBF;  
 - non-optimal liquid production;  
-- high energy consumption (low URE/УРЭ).
+- high energy consumption.
 
 This repository presents a **unified optimisation approach**, combining:
 
