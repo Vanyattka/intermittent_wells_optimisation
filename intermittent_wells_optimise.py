@@ -3,11 +3,10 @@
 
 """
 ПКВ-оптимизатор с гидростатикой (Tkinter + Matplotlib, bmh)
-Обновления:
-- Отдельный график f_on(T_accum)
-- Два графика в одну строку (слева Q_day, справа f_on)
-- Поиск «точки перегиба» (knee) на f_on(T) и вывод её параметров
-- Зелёные метки точки перегиба на обоих графиках
+- Первая вкладка: Q_day(T_acc) и f_on(T_acc) + блоки оптимумов (по Q и по f_on) и «перегиб f_on».
+- Вторая вкладка: p_wb(t), q_in(t), q_pump(t) на 4 полных цикла (верх — энерг.оптимум, низ — Q-оптимум).
+- [FIX] Динамика в «стопе»: насос=0, приток=a, p_wb=p_wb0 (осмысленный вид графиков).
+- Дефолтные параметры — как на скрине пользователя.
 """
 
 import math
@@ -31,17 +30,12 @@ def ring_area(d_obs_m: float, d_nkt_m: float) -> float:
     return math.pi / 4.0 * (d_obs_m**2 - d_nkt_m**2)
 
 def gamma_atma_per_m(rho_kgm3: float) -> float:
-    # gamma = rho*g / (Pa_per_atm)  [атм/м]
-    return (rho_kgm3 * G) / P_ATM
+    return (rho_kgm3 * G) / P_ATM   # атм/м
 
 # -------- Накопление --------
 def accumulation_volume(T_accum_sec: float, k_prod_m3dayatma: float,
                         p_res_atma: float, p_wb0_atma: float,
                         rho_kgm3: float, S_m2: float):
-    """
-    x0 (= dv) — объём, накопленный за фазу накопления (м^3)
-    a, b      — коэффициенты ОДУ (м^3/с и 1/с)
-    """
     k_sec = k_prod_m3dayatma / 86400.0
     Delta_p0 = p_res_atma - p_wb0_atma
     gamma = gamma_atma_per_m(rho_kgm3)
@@ -55,7 +49,6 @@ def accumulation_volume(T_accum_sec: float, k_prod_m3dayatma: float,
 
 # -------- Откачка --------
 def x_in_ramp(t, x0, a, b, q_opt, tau):
-    """Решение x(t) на разгоне (0..tau) для ẋ = a - b x - (q_opt/τ) t."""
     eb = math.exp(-b * t)
     return (
         x0 * eb
@@ -65,12 +58,6 @@ def x_in_ramp(t, x0, a, b, q_opt, tau):
     )
 
 def pump_time_with_hydro(x0, a, b, q_opt, tau):
-    """
-    Возвращает (T_pump_sec, regime)
-      regime: "ramp"  — опустошили на разгоне
-              "plate" — дошли до полки и опустошили на полке
-              "impossible" — q_opt <= a, опустошить нельзя
-    """
     f0   = x_in_ramp(0.0,  x0, a, b, q_opt, tau)
     f_tau= x_in_ramp(tau,  x0, a, b, q_opt, tau)
 
@@ -86,7 +73,6 @@ def pump_time_with_hydro(x0, a, b, q_opt, tau):
             if hi - lo < 1e-7: break
         return 0.5 * (lo + hi), "ramp"
 
-    # не успели на разгоне → полка
     if q_opt <= a:
         return float('inf'), "impossible"
     x_tau = f_tau
@@ -94,7 +80,6 @@ def pump_time_with_hydro(x0, a, b, q_opt, tau):
     return T_pump_sec, "plate"
 
 def pumped_volume_through_pump(T_pump_sec, q_opt, tau, regime):
-    """Интеграл q_pump dt (без времени остановки)."""
     if not math.isfinite(T_pump_sec) or T_pump_sec <= 0: return 0.0
     if regime == "ramp":
         return (q_opt / (2.0 * tau)) * T_pump_sec**2
@@ -124,20 +109,24 @@ def metrics_for_Taccum_hydro(T_accum_min: float,
     T_total_min = T_total_sec / 60.0
 
     if not math.isfinite(T_total_min) or T_total_min <= 0:
-        return dict(q_opt=q_opt, S=S, a=a, b=b, x0=x0, regime=regime,
-                    T_pump_min=float('inf'), T_total_min=float('inf'),
-                    N_cycles_day=0.0, Q_day_m3=0.0, V_pump_m3=0.0, f_on=1.0)
+        return dict(
+            q_opt=q_opt, S=S, a=a, b=b, x0=x0, regime=regime,
+            T_pump_min=float('inf'), T_total_min=float('inf'),
+            N_cycles_day=0.0, Q_day_m3=0.0, V_pump_m3=0.0, f_on=1.0
+        )
 
     V_pump = pumped_volume_through_pump(T_pump_sec, q_opt, tau_ramp_sec, regime)
     N      = 86400.0 / T_total_sec
     Q_day  = V_pump * N
     f_on   = (T_pump_sec + T_stop_sec) / T_total_sec
 
-    return dict(q_opt=q_opt, S=S, a=a, b=b, x0=x0, regime=regime,
-                T_pump_min=T_pump_sec / 60.0, T_total_min=T_total_min,
-                N_cycles_day=N, Q_day_m3=Q_day, V_pump_m3=V_pump, f_on=f_on)
+    return dict(
+        q_opt=q_opt, S=S, a=a, b=b, x0=x0, regime=regime,
+        T_pump_min=T_pump_sec / 60.0, T_total_min=T_total_min,
+        N_cycles_day=N, Q_day_m3=Q_day, V_pump_m3=V_pump, f_on=f_on
+    )
 
-# -------- Оптимизации по Q и по f_on --------
+# -------- Оптимизации --------
 def optimize_Taccum_hydro(Tmin: float, Tmax: float,
                           k_prod_m3dayatma: float,
                           q_esp_m3day_opt: float,
@@ -148,7 +137,7 @@ def optimize_Taccum_hydro(Tmin: float, Tmax: float,
                           d_nkt_m: float,
                           tau_ramp_sec: float,
                           add_stop_equals_tau: bool):
-    T_grid = np.linspace(Tmin, Tmax, 800)
+    T_grid = np.linspace(Tmin, Tmax, 1000)
     Q_grid, Fon_grid, M_grid = [], [], []
     for T in T_grid:
         m = metrics_for_Taccum_hydro(T, k_prod_m3dayatma, q_esp_m3day_opt, p_wb0_atma,
@@ -170,27 +159,114 @@ def optimize_Taccum_hydro(Tmin: float, Tmax: float,
         metrics_list=M_grid
     )
 
-# -------- Точка перегиба (knee) на f_on(T) --------
+# -------- «Перегиб» f_on(T) --------
 def find_knee_point(T, F):
-    """
-    Поиск «локтя» (Kneedle): максимальная вертикальная разность
-    между кривой F(T) и прямой, соединяющей концы (T0,F0)-(T1,F1).
-    f_on убывает и выполаживается вправо — локоть получается в месте перегиба.
-    """
     T = np.asarray(T); F = np.asarray(F)
-    # прямая по концам:
     F_line = F[0] + (F[-1] - F[0]) * (T - T[0]) / (T[-1] - T[0])
-    # для убывающей кривой ищем максимум (F_line - F)
     diff = F_line - F
     idx = int(np.argmax(diff))
     return idx
+
+# -------- [FIX] Синтез временных рядов 1 цикла --------
+def simulate_one_cycle(T_acc_min,
+                       k_prod_m3dayatma, q_esp_m3day_opt,
+                       p_wb0_atma, p_res_atma,
+                       rho_kgm3, d_obs_m, d_nkt_m,
+                       tau_ramp_sec, add_stop_equals_tau,
+                       dt_sec=1.0):
+    """
+    В накоплении: x(t) по аналитике; p_wb = p_wb0 + gamma*x/S; q_in = a - b*x; q_pump = 0.
+    В откачке:    x(t) по аналитике (разгон/полка); q_pump = q_opt*t/tau → q_opt; q_in = a - b*x.
+    [FIX] Стоп:   насос=0, p_wb = p_wb0 (уровень ~0), НО приток идёт при этом dp=Δp0 ⇒ q_in = a.
+                  Это убирает «сломанные» ступени и даёт физически осмысленный график.
+    """
+    S = ring_area(d_obs_m, d_nkt_m)
+    gamma = gamma_atma_per_m(rho_kgm3)
+    k_sec = k_prod_m3dayatma/86400.0
+    a = k_sec*(p_res_atma - p_wb0_atma)
+    b = (k_sec*gamma)/S
+    q_opt = q_esp_m3day_opt/86400.0
+
+    # --- накопление
+    T_acc_sec = 60.0*T_acc_min
+    t_acc = np.arange(0.0, T_acc_sec, dt_sec)
+    if t_acc.size == 0 or t_acc[-1] < T_acc_sec: t_acc = np.append(t_acc, T_acc_sec)
+    if b <= 1e-18:
+        x_acc = a*t_acc
+    else:
+        x_acc = (a/b)*(1.0 - np.exp(-b*t_acc))
+    p_acc = p_wb0_atma + gamma*(x_acc/S)
+    qin_acc = a - b*x_acc
+    qp_acc = np.zeros_like(t_acc)
+
+    x0 = x_acc[-1]  # старт откачки
+
+    # --- откачка
+    T_pump_sec, regime = pump_time_with_hydro(x0, a, b, q_opt, tau_ramp_sec)
+    t_pump = np.arange(0.0, T_pump_sec, dt_sec)
+    if t_pump.size == 0 or t_pump[-1] < T_pump_sec: t_pump = np.append(t_pump, T_pump_sec)
+
+    x_pump = np.empty_like(t_pump)
+    qp_pump = np.empty_like(t_pump)
+    for i, t in enumerate(t_pump):
+        if t <= tau_ramp_sec:
+            x_val = x_in_ramp(t, x0, a, b, q_opt, tau_ramp_sec)
+            qp = q_opt*(t/tau_ramp_sec)
+        else:
+            x_tau = x_in_ramp(tau_ramp_sec, x0, a, b, q_opt, tau_ramp_sec)
+            dt = t - tau_ramp_sec
+            x_val = x_tau*np.exp(-b*dt) + (a - q_opt)/b*(1.0 - np.exp(-b*dt))
+            qp = q_opt
+        x_pump[i] = max(x_val, 0.0)
+        qp_pump[i] = qp
+
+    p_pump = p_wb0_atma + gamma*(x_pump/S)
+    qin_pump = a - b*x_pump
+
+    # --- стоп (накладка по времени)
+    if add_stop_equals_tau:
+        T_stop_sec = tau_ramp_sec
+        t_stop = np.arange(0.0, T_stop_sec, dt_sec)
+        if t_stop.size == 0 or t_stop[-1] < T_stop_sec: t_stop = np.append(t_stop, T_stop_sec)
+        p_stop = np.full_like(t_stop, p_wb0_atma)           # уровень ~0 ⇒ p_wb ~ p_wb0
+        qin_stop = np.full_like(t_stop, a)                  # [FIX] приток идёт при dp=Δp0
+        qp_stop = np.zeros_like(t_stop)                     # насос выключен
+
+        # склейка
+        t = np.concatenate([t_acc,
+                            T_acc_sec + t_pump,
+                            T_acc_sec + T_pump_sec + t_stop])
+        p = np.concatenate([p_acc, p_pump, p_stop])
+        qin = np.concatenate([qin_acc, qin_pump, qin_stop])
+        qp = np.concatenate([qp_acc, qp_pump, qp_stop])
+    else:
+        t = np.concatenate([t_acc, T_acc_sec + t_pump])
+        p = np.concatenate([p_acc, p_pump])
+        qin = np.concatenate([qin_acc, qin_pump])
+        qp = np.concatenate([qp_acc, qp_pump])
+
+    return dict(t_sec=t, p_wb_atm=p, q_in_m3s=qin, q_pump_m3s=qp,
+                T_cycle_sec=t[-1])
+
+def simulate_four_cycles(T_acc_min, params, dt_sec=1.0):
+    one = simulate_one_cycle(T_acc_min, **params, dt_sec=dt_sec)
+    t0, p0, qi0, qp0 = one['t_sec'], one['p_wb_atm'], one['q_in_m3s'], one['q_pump_m3s']
+    Tcyc = one['T_cycle_sec']
+    t = np.array([]); p = np.array([]); qi = np.array([]); qp = np.array([])
+    for k in range(4):
+        shift = k*Tcyc
+        t = np.concatenate([t, t0 + shift])
+        p = np.concatenate([p, p0])
+        qi = np.concatenate([qi, qi0])
+        qp = np.concatenate([qp, qp0])
+    return dict(t_sec=t, p_wb_atm=p, q_in_m3s=qi, q_pump_m3s=qp)
 
 # -------- GUI --------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ПКВ оптимизация (гидростатика, плотность/диаметры) — bmh")
-        self.geometry("1320x820")
+        self.geometry("1340x880")
         self._build()
 
     def _build(self):
@@ -213,18 +289,18 @@ class App(tk.Tk):
             e.grid(row=row, column=1, sticky="w", pady=2)
             return e
 
-        # Ввод
-        self.var_k      = tk.StringVar(value="0.05")   # м3/сут/атм
-        self.var_qesp   = tk.StringVar(value="45")     # м3/сут
-        self.var_pwb0   = tk.StringVar(value="48")     # атм
-        self.var_pres   = tk.StringVar(value="195")    # атм
-        self.var_rho    = tk.StringVar(value="800")    # кг/м3
+        # --- ДЕФОЛТЫ (как на твоём втором скрине)
+        self.var_k      = tk.StringVar(value="1.35")   # м3/сут/атм
+        self.var_qesp   = tk.StringVar(value="124")    # м3/сут
+        self.var_pwb0   = tk.StringVar(value="43")     # атм
+        self.var_pres   = tk.StringVar(value="108")    # атм
+        self.var_rho    = tk.StringVar(value="820")    # кг/м3
         self.var_dobs   = tk.StringVar(value="0.159")  # м
-        self.var_dnkt   = tk.StringVar(value="0.073")  # м
-        self.var_tau    = tk.StringVar(value="15")     # с
+        self.var_dnkt   = tk.StringVar(value="0.062")  # м
+        self.var_tau    = tk.StringVar(value="25")     # с
         self.var_tmin   = tk.StringVar(value="2")      # мин
         self.var_tmax   = tk.StringVar(value="25")     # мин
-        self.var_stop_eq_tau = tk.BooleanVar(value=False)
+        self.var_stop_eq_tau = tk.BooleanVar(value=True)
 
         add_field(0, "k_prod, м³/сут/атм:", self.var_k)
         add_field(1, "q_esp_opt, м³/сут:",  self.var_qesp)
@@ -243,7 +319,7 @@ class App(tk.Tk):
         ttk.Button(left, text="Рассчитать", command=self.run_calc)\
             .grid(row=12, column=0, columnspan=2, sticky="we", pady=(10, 4))
 
-        # Метрики (Q-оптимум и энерго-оптимум)
+        # Метрики
         metrics = ttk.LabelFrame(right, text="Результаты (Q-оптимум и min f_on)")
         metrics.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 6))
 
@@ -254,6 +330,8 @@ class App(tk.Tk):
             "Q_day_q": tk.StringVar(), "V_pump_q": tk.StringVar(), "f_on_q": tk.StringVar(), "regime_q": tk.StringVar(),
             "T_accum_e": tk.StringVar(), "T_pump_e": tk.StringVar(), "N_e": tk.StringVar(),
             "Q_day_e": tk.StringVar(), "V_pump_e": tk.StringVar(), "f_on_e": tk.StringVar(), "regime_e": tk.StringVar(),
+            "T_accum_k": tk.StringVar(), "T_pump_k": tk.StringVar(), "N_k": tk.StringVar(),
+            "Q_day_k": tk.StringVar(), "V_pump_k": tk.StringVar(), "f_on_k": tk.StringVar(), "regime_k": tk.StringVar(),
             "warn": tk.StringVar()
         }
 
@@ -292,57 +370,48 @@ class App(tk.Tk):
         add_metric("Q_day°, м³/сут:",            "Q_day_e",   4)
         row += 1
         add_metric("режим:",                     "regime_e",  0)
-
-        # Блок «Оптимум (перегиб f_on)»
-        self.knee_frame = ttk.LabelFrame(right, text="Оптимум (перегиб f_on)")
-        self.knee_frame.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(0, 8))
-        self.knee_vars = {
-            "T_accum": tk.StringVar(), "T_pump": tk.StringVar(), "f_on": tk.StringVar(),
-            "N": tk.StringVar(), "V_pump": tk.StringVar(), "Q_day": tk.StringVar(), "regime": tk.StringVar()
-        }
-        r=0
-        def add_knee(label, key, col):
-            ttk.Label(self.knee_frame, text=label).grid(row=r, column=col, sticky="w", padx=(8,4), pady=2)
-            ttk.Label(self.knee_frame, textvariable=self.knee_vars[key]).grid(row=r, column=col+1, sticky="w", pady=2)
-        add_knee("T_accum^ (мин):", "T_accum", 0)
-        add_knee("T_pump^ (мин):",  "T_pump",  2)
-        add_knee("f_on^:",          "f_on",    4); r+=1
-        add_knee("N^ (1/сут):",     "N",       0)
-        add_knee("V_pump^ (м³):",   "V_pump",  2)
-        add_knee("Q_day^ (м³/сут):","Q_day",   4); r+=1
-        add_knee("режим:",          "regime",  0)
+        ttk.Separator(metrics).grid(row=row, column=0, columnspan=6, sticky="ew", pady=(6, 2))
+        row += 1
+        add_metric("Перегиб T_accum^, мин:", "T_accum_k", 0)
+        add_metric("T_pump^, мин:",          "T_pump_k",  2)
+        add_metric("f_on^:",                 "f_on_k",    4)
+        row += 1
+        add_metric("N^, 1/сут:",             "N_k",       0)
+        add_metric("V_pump^, м³:",           "V_pump_k",  2)
+        add_metric("Q_day^, м³/сут:",        "Q_day_k",   4)
+        row += 1
+        add_metric("режим:",                 "regime_k",  0)
 
         # ---- два графика в строку
         plots_row = ttk.Frame(right)
         plots_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
-        # левый: Q_day(T)
-        figL = plt.figure(figsize=(6.4, 4.8))
-        self.axQ = figL.add_subplot(111)
+        figL = plt.figure(figsize=(6.6, 4.8)); self.axQ = figL.add_subplot(111)
         self.canvasQ = FigureCanvasTkAgg(figL, master=plots_row)
         self.canvasQ.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
 
-        # правый: f_on(T)
-        figR = plt.figure(figsize=(6.4, 4.8))
-        self.axF = figR.add_subplot(111)
+        figR = plt.figure(figsize=(12.6, 4.8)); self.axF = figR.add_subplot(111)
         self.canvasF = FigureCanvasTkAgg(figR, master=plots_row)
         self.canvasF.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
+        # ---- вкладка "Динамика за 4 цикла"
+        tab_dyn = ttk.Frame(nb); nb.add(tab_dyn, text="Динамика за 4 цикла")
+        dyn_frame = ttk.Frame(tab_dyn, padding=(8, 10)); dyn_frame.pack(fill=tk.BOTH, expand=True)
+
+        figD = plt.figure(figsize=(10.5, 7.6))
+        self.axD_top = figD.add_subplot(2, 1, 1)
+        self.axD_bot = figD.add_subplot(2, 1, 2)
+        self.canvasD = FigureCanvasTkAgg(figD, master=dyn_frame)
+        self.canvasD.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
         # ---- вкладка "Модель"
-        tab_model = ttk.Frame(nb)
-        nb.add(tab_model, text="Модель")
-        txt = ScrolledText(tab_model, wrap="word", height=40)
+        tab_model = ttk.Frame(nb); nb.add(tab_model, text="Модель")
+        txt = ScrolledText(tab_model, wrap="word", height=38)
         txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        txt.insert("1.0", (
-            "Формулы (гидростатика):\n"
-            "Накопление: ẋ = a - b x, x(0)=0 → x(t)=(a/b)(1-e^{-bt})\n"
-            "Откачка: ẋ = a - b x - q_p(t), q_p(t)=q_opt·t/τ на [0,τ], далее q_opt\n"
-            "T_pump: ramp → корень x(t)=0; plate → τ + (1/b)·ln(1 + b·x_τ/(q_opt - a)), q_opt>a\n"
-            "V_pump: ramp→ q_opt t*²/(2τ); plate→ q_opt (T_pump - τ/2)\n"
-            "Q_day = V_pump · 86400/(T_accum + T_pump + T_stop)\n"
-            "f_on  = (T_pump+T_stop)/(T_accum+T_pump+T_stop)\n"
-            "a = k_sec·(p_res - p_wb0),  b = k_sec·γ/S,  γ=ρg/p_atm,  S=π/4(d_obs^2-d_nkt^2)\n"
-        ))
+        txt.insert("1.0",
+            "Формулы (гидростатика): ẋ=a-bx; ẋ=a-bx-q_p(t); T_pump (ramp/plate); "
+            "V_pump; Q_day; f_on; a=k_secΔp0; b=k_secγ/S; γ=ρg/p_atm; S=π/4(d_obs²-d_nkt²) "
+        )
         txt.configure(state="disabled")
 
         self.run_calc()
@@ -361,13 +430,12 @@ class App(tk.Tk):
             tmax   = float(self.var_tmax.get())
             add_stop = bool(self.var_stop_eq_tau.get())
         except ValueError:
-            messagebox.showerror("Ошибка", "Проверьте, что все поля заполнены числами.")
-            return
+            messagebox.showerror("Ошибка", "Проверьте ввод чисел."); return
 
         if tmin <= 0 or tmax <= 0 or tmax < tmin:
             messagebox.showerror("Ошибка", "Неверные границы T_accum."); return
         if pres <= pwb0:
-            messagebox.showerror("Ошибка", "p_res должно быть больше p_wb0."); return
+            messagebox.showerror("Ошибка", "p_res должно быть > p_wb0."); return
         if tau <= 0:
             messagebox.showerror("Ошибка", "τ должно быть > 0."); return
         if dobs <= dnkt:
@@ -375,117 +443,113 @@ class App(tk.Tk):
         if rho <= 0:
             messagebox.showerror("Ошибка", "ρ должно быть > 0."); return
 
-        # Оптимизация: максимум Q и минимум f_on
         opt = optimize_Taccum_hydro(tmin, tmax, k, qesp, pwb0, pres, rho, dobs, dnkt, tau, add_stop)
         T_grid, Q_grid, Fon_grid = opt['T_grid'], opt['Q_grid'], opt['Fon_grid']
         T_best_q, best_q = opt['T_best_q'], opt['best_q']
         T_best_e, best_e = opt['T_best_e'], opt['best_e']
 
-        # Поиск «перегиба» f_on(T)
         idx_knee = find_knee_point(T_grid, Fon_grid)
         T_knee = float(T_grid[idx_knee])
         m_knee = metrics_for_Taccum_hydro(T_knee, k, qesp, pwb0, pres, rho, dobs, dnkt, tau, add_stop)
 
-        # Служебные метрики
-        S = ring_area(dobs, dnkt)
-        gamma = gamma_atma_per_m(rho)
+        # служебные
+        S = ring_area(dobs, dnkt); gamma = gamma_atma_per_m(rho)
         self.metric_vars["q_opt"].set(f"{best_q['q_opt']*86400:.3f} м³/сут")
-        self.metric_vars["S"].set(f"{S:.6f}")
-        self.metric_vars["gamma"].set(f"{gamma:.6f}")
-        self.metric_vars["a"].set(f"{best_q['a']:.6e}")
-        self.metric_vars["b"].set(f"{best_q['b']:.6e}")
+        self.metric_vars["S"].set(f"{S:.6f}"); self.metric_vars["gamma"].set(f"{gamma:.6f}")
+        self.metric_vars["a"].set(f"{best_q['a']:.6e}"); self.metric_vars["b"].set(f"{best_q['b']:.6e}")
         warn = ""
-        if best_q['regime'] == "impossible" or best_e['regime'] == "impossible":
-            warn = "Опорожнение невозможно (q_opt ≤ a). Увеличьте q_esp_opt или снизьте Δp0/ρ/S."
+        if best_q['regime']=="impossible" or best_e['regime']=="impossible":
+            warn = "Опорожнение невозможно (q_opt ≤ a). Повышайте q_esp_opt или снижайте Δp0/ρ/S."
         self.metric_vars["warn"].set(warn)
 
-        # Заполнение метрик: Q-оптимум
-        self.metric_vars["T_accum_q"].set(f"{T_best_q:.3f}")
-        self.metric_vars["T_pump_q"].set(f"{best_q['T_pump_min']:.3f}")
-        self.metric_vars["N_q"].set(f"{best_q['N_cycles_day']:.3f}")
-        self.metric_vars["V_pump_q"].set(f"{best_q['V_pump_m3']:.4f}")
-        self.metric_vars["Q_day_q"].set(f"{best_q['Q_day_m3']:.3f}")
-        self.metric_vars["f_on_q"].set(f"{best_q['f_on']:.4f}")
-        self.metric_vars["regime_q"].set(best_q['regime'])
+        # метрики
+        for (pref, Tacc, m) in (("q", T_best_q, best_q), ("e", T_best_e, best_e), ("k", T_knee, m_knee)):
+            self.metric_vars[f"T_accum_{pref}"].set(f"{Tacc:.3f}")
+            self.metric_vars[f"T_pump_{pref}"].set(f"{m['T_pump_min']:.3f}")
+            self.metric_vars[f"N_{pref if pref!='q' else 'q'}"].set(f"{m['N_cycles_day']:.3f}")
+            self.metric_vars[f"V_pump_{pref}"].set(f"{m['V_pump_m3']:.4f}")
+            self.metric_vars[f"Q_day_{pref}"].set(f"{m['Q_day_m3']:.3f}")
+            self.metric_vars[f"f_on_{pref}"].set(f"{m['f_on']:.4f}")
+            self.metric_vars[f"regime_{pref}"].set(m['regime'])
 
-        # Энерго-оптимум
-        self.metric_vars["T_accum_e"].set(f"{T_best_e:.3f}")
-        self.metric_vars["T_pump_e"].set(f"{best_e['T_pump_min']:.3f}")
-        self.metric_vars["N_e"].set(f"{best_e['N_cycles_day']:.3f}")
-        self.metric_vars["V_pump_e"].set(f"{best_e['V_pump_m3']:.4f}")
-        self.metric_vars["Q_day_e"].set(f"{best_e['Q_day_m3']:.3f}")
-        self.metric_vars["f_on_e"].set(f"{best_e['f_on']:.4f}")
-        self.metric_vars["regime_e"].set(best_e['regime'])
-
-        # Блок «Оптимум (перегиб f_on)»
-        self.knee_vars["T_accum"].set(f"{T_knee:.3f}")
-        self.knee_vars["T_pump"].set(f"{m_knee['T_pump_min']:.3f}")
-        self.knee_vars["f_on"].set(f"{m_knee['f_on']:.4f}")
-        self.knee_vars["N"].set(f"{m_knee['N_cycles_day']:.3f}")
-        self.knee_vars["V_pump"].set(f"{m_knee['V_pump_m3']:.4f}")
-        self.knee_vars["Q_day"].set(f"{m_knee['Q_day_m3']:.3f}")
-        self.knee_vars["regime"].set(m_knee['regime'])
-
-        # ---- ЛЕВЫЙ график: Q_day(T_accum)
+        # --- ЛЕВЫЙ график: Q_day(T)
         self.axQ.clear()
-        self.axQ.plot(T_grid, Q_grid, label="Q_day(T_accum)")
-        self.axQ.scatter([T_best_q], [best_q['Q_day_m3']], label="Q-оптимум")
-        self.axQ.axvline(T_best_e, linestyle="--", linewidth=1.2, label=f"min f_on @ {T_best_e:.2f} мин")
-        # зелёная точка — перегиб
-        self.axQ.scatter([T_knee], [np.interp(T_knee, T_grid, Q_grid)], color="green", zorder=4, label="перегиб f_on")
-        self.axQ.set_title("Q_day vs. T_accum (гидростатика)")
-        self.axQ.set_xlabel("T_accum, мин")
-        self.axQ.set_ylabel("Q_day, м³/сут")
-        self.axQ.legend(loc="best", fontsize=9, framealpha=0.85)
-        self.axQ.grid(True)
-        self.axQ.figure.tight_layout()
-        self.canvasQ.draw_idle()
+        self.axQ.plot(T_grid, Q_grid)
+        self.axQ.scatter([T_best_q], [best_q['Q_day_m3']], label="Оптимум по накопленной добыче")
+        self.axQ.axvline(T_best_e, linestyle="--", linewidth=1.2)
+        self.axQ.scatter([T_knee], [np.interp(T_knee, T_grid, Q_grid)], color="green", zorder=4, label="Оптимум по времени работы УЭЦН в цикле")
+        self.axQ.set_title("Добыча от длительности цикла накопления")
+        self.axQ.set_xlabel("Время накопления, мин"); self.axQ.set_ylabel("Q_day, м³/сут")
+        self.axQ.legend(loc="best", fontsize=9, framealpha=0.85); self.axQ.grid(True)
+        self.axQ.figure.tight_layout(); self.canvasQ.draw_idle()
 
-        # === после того как посчитаны T_grid, Q_grid, Fon_grid, T_knee и построены оба графика ===
-
-        if add_stop:
-            # границы «оптимальной зоны»: от точки перегиба до правого края диапазона
-            T_opt_lo = T_knee
-            T_opt_hi = float(T_grid[-1])
-
-            # левая ось: Q_day(T_accum)
-            self.axQ.axvspan(T_opt_lo, T_opt_hi, alpha=0.18, color='green', label="оптимальная зона")
-            yq_annot = float(np.interp(T_opt_lo, T_grid, Q_grid))
-            self.axQ.annotate("оптимальная зона",
-                            xy=(T_opt_lo, yq_annot), xytext=(8, 12),
-                            textcoords="offset points", fontsize=9,
-                            bbox=dict(facecolor='white', alpha=0.75, edgecolor='none'))
-
-            # правая ось: f_on(T_accum)
-            self.axF.axvspan(T_opt_lo, T_opt_hi, alpha=0.18, color='green', label="оптимальная зона")
-            yf_annot = float(np.interp(T_opt_lo, T_grid, Fon_grid))
-            self.axF.annotate("оптимальная зона",
-                            xy=(T_opt_lo, yf_annot), xytext=(8, 12),
-                            textcoords="offset points", fontsize=9,
-                            bbox=dict(facecolor='white', alpha=0.75, edgecolor='none'))
-
-            # обновляем легенды после добавления зоны
-            self.axQ.legend(loc="best", fontsize=9, framealpha=0.85)
-            self.axF.legend(loc="best", fontsize=9, framealpha=0.85)
-
-        # перерисовка (если вставляешь до draw_idle — можно оставить как есть)
-        self.canvasQ.draw_idle()
-        self.canvasF.draw_idle()
-
-
-        # ---- ПРАВЫЙ график: f_on(T_accum)
+        # --- ПРАВЫЙ график: f_on(T)
         self.axF.clear()
-        self.axF.plot(T_grid, Fon_grid, label="f_on(T_accum)")
+        self.axF.plot(T_grid, Fon_grid, label="f_on от времени накопления")
         self.axF.scatter([T_best_e], [best_e['f_on']], label="min f_on", zorder=3)
-        # зелёная точка — перегиб
         self.axF.scatter([T_knee], [Fon_grid[idx_knee]], color="green", zorder=4, label="перегиб f_on")
-        self.axF.set_title("Доля on-time f_on vs. T_accum")
-        self.axF.set_xlabel("T_accum, мин")
-        self.axF.set_ylabel("f_on, доля")
-        self.axF.legend(loc="best", fontsize=9, framealpha=0.85)
-        self.axF.grid(True)
-        self.axF.figure.tight_layout()
-        self.canvasF.draw_idle()
+        self.axF.set_title("Откачка за цикл (f_on)") 
+        self.axF.set_xlabel("Время накопления, мин"); self.axF.set_ylabel("Откачка за весь цикл, д.ед.")
+        self.axF.legend(loc="best", fontsize=9, framealpha=0.85); self.axF.grid(True)
+        self.axF.figure.tight_layout(); self.canvasF.draw_idle()
+
+        # ----------- Вкладка "Динамика за 4 цикла" -----------
+        sim_params = dict(
+            k_prod_m3dayatma=k, q_esp_m3day_opt=qesp,
+            p_wb0_atma=pwb0, p_res_atma=pres,
+            rho_kgm3=rho, d_obs_m=dobs, d_nkt_m=dnkt,
+            tau_ramp_sec=tau, add_stop_equals_tau=add_stop
+        )
+        dyn_e = simulate_four_cycles(T_best_e, sim_params, dt_sec=1.0)
+        dyn_q = simulate_four_cycles(T_best_q, sim_params, dt_sec=1.0)
+
+        # ===== Верх: Энерго-оптимум =====
+        self.axD_top.clear()
+        t_e_min = dyn_e['t_sec'] / 60.0
+        p_e      = dyn_e['p_wb_atm']
+        qi_e_day = dyn_e['q_in_m3s']   * 86400.0  # м³/сут
+        qp_e_day = dyn_e['q_pump_m3s'] * 86400.0  # м³/сут
+
+        ax = self.axD_top
+        ln_p, = ax.plot(t_e_min, p_e, color='tab:blue', label="p_wb, атм", linewidth=1.6)
+        ax.set_ylabel("p_wb, атм")
+        ax.set_title("Динамика за 4 цикла — Энерго-оптимум (min f_on)")
+        ax.grid(True)
+
+        axr = ax.twinx()
+        ln_qi, = axr.plot(t_e_min, qi_e_day, color='tab:orange', label="q_in, м³/сут", linewidth=1.4)
+        ln_qp, = axr.plot(t_e_min, qp_e_day, color='tab:red',    label="q_pump, м³/сут", linewidth=1.4)
+        axr.set_ylabel("дебиты, м³/сут")
+
+        lines = [ln_p, ln_qi, ln_qp]
+        labels = [l.get_label() for l in lines]
+        ax.legend(lines, labels, loc="upper right", fontsize=8)
+
+        # ===== Низ: Оптимум по накопленной =====
+        self.axD_bot.clear()
+        t_q_min = dyn_q['t_sec'] / 60.0
+        p_q      = dyn_q['p_wb_atm']
+        qi_q_day = dyn_q['q_in_m3s']   * 86400.0  # м³/сут
+        qp_q_day = dyn_q['q_pump_m3s'] * 86400.0  # м³/сут
+
+        ax = self.axD_bot
+        ln_p2, = ax.plot(t_q_min, p_q, color='tab:blue', label="p_wb, атм", linewidth=1.6)
+        ax.set_xlabel("Время, мин")
+        ax.set_ylabel("p_wb, атм")
+        ax.set_title("Динамика за 4 цикла — Оптимум по накопленной (max Q_day)")
+        ax.grid(True)
+
+        axr = ax.twinx()
+        ln_qi2, = axr.plot(t_q_min, qi_q_day, color='tab:orange', label="q_in, м³/сут", linewidth=1.4)
+        ln_qp2, = axr.plot(t_q_min, qp_q_day, color='tab:red',    label="q_pump, м³/сут", linewidth=1.4)
+        axr.set_ylabel("дебиты, м³/сут")
+
+        lines2 = [ln_p2, ln_qi2, ln_qp2]
+        labels2 = [l.get_label() for l in lines2]
+        ax.legend(lines2, labels2, loc="upper right", fontsize=8)
+
+        self.canvasD.draw_idle()
+
 
 if __name__ == "__main__":
     App().mainloop()
